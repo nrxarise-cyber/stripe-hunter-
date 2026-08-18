@@ -1,0 +1,4 @@
+pyrogram==2.0.106
+TgCrypto==1.2.5
+requests==2.32.3
+shodan==1.31.0
