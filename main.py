@@ -1,21 +1,9 @@
 """
-Shopify / Stripe Site Hunter Telegram Bot.
-
-Sources:
-    - BuiltWith Change API
-
-Telegram:
-    - /start
-    - /stats
-    - /latest
-    - /search <query>
-    - /scan
-
-The bot stores unique domains in SQLite and forwards new
-discoveries to TARGET_CHANNEL.
+Shopify / Stripe Site Hunter Telegram Bot (Improved & Robust)
 """
 
 import asyncio
+import html
 import logging
 import re
 import sqlite3
@@ -24,11 +12,11 @@ from urllib.parse import urlparse
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ParseMode
+from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message
 
 import config
 from ratelimit import RateLimiter, RateLimitError, request_with_backoff
-
 
 # ============================================================
 # LOGGING
@@ -38,9 +26,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 log = logging.getLogger("sitehunter")
-
 
 # ============================================================
 # RATE LIMITER
@@ -48,23 +34,18 @@ log = logging.getLogger("sitehunter")
 
 BUILTWITH_LIMITER = RateLimiter(
     "BuiltWith",
-    config.BUILTWITH_RPM,
+    getattr(config, "BUILTWITH_RPM", 10),
 )
-
 
 # ============================================================
 # DOMAIN FILTER
 # ============================================================
 
 DOMAIN_RE = re.compile(
-    r"^(?:"
-    r"[a-z0-9]"
-    r"(?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"\.)+"
-    r"[a-z]{2,}$"
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$"
 )
 
-SKIP_HOSTS = (
+SKIP_HOSTS = {
     "shopify.com",
     "stripe.com",
     "google.com",
@@ -78,11 +59,11 @@ SKIP_HOSTS = (
     "linkedin.com",
     "instagram.com",
     "pinterest.com",
-)
+}
 
 
 def clean_domain(value: str) -> str | None:
-    if not value:
+    if not value or not isinstance(value, str):
         return None
 
     value = value.strip().lower()
@@ -90,227 +71,191 @@ def clean_domain(value: str) -> str | None:
     if "://" in value:
         value = urlparse(value).netloc or value
 
-    value = (
-        value
-        .split("/")[0]
-        .split("?")[0]
-        .split(":")[0]
-    )
+    # Strip paths, queries, ports
+    value = value.split("/")[0].split("?")[0].split(":")[0]
 
     if value.startswith("www."):
         value = value[4:]
-
     if value.startswith("*."):
         value = value[2:]
 
     if not DOMAIN_RE.match(value):
         return None
 
-    if any(
-        value == host or value.endswith("." + host)
-        for host in SKIP_HOSTS
-    ):
+    if any(value == host or value.endswith("." + host) for host in SKIP_HOSTS):
         return None
 
     return value
 
 
 # ============================================================
-# DATABASE
+# THREAD-SAFE DATABASE HANDLER
 # ============================================================
 
 class DB:
     def __init__(self, path: str):
-        self.conn = sqlite3.connect(
-            path,
-            check_same_thread=False,
-        )
+        self.path = path
+        self.lock = asyncio.Lock()
+        self._init_db()
 
-        self.conn.row_factory = sqlite3.Row
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sites (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain TEXT NOT NULL UNIQUE,
-                technology TEXT NOT NULL,
-                first_seen TEXT NOT NULL,
-                source TEXT NOT NULL
+    def _init_db(self):
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL UNIQUE,
+                    technology TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    source TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-
-        self.conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_first_seen
-            ON sites(first_seen)
-            """
-        )
-
-        self.conn.commit()
-
-    def add(
-        self,
-        domain: str,
-        technology: str,
-        source: str,
-    ) -> bool:
-        try:
-            self.conn.execute(
+            conn.execute(
                 """
-                INSERT INTO sites
-                (domain, technology, first_seen, source)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    domain,
-                    technology,
-                    datetime.now(timezone.utc).isoformat(
-                        timespec="seconds"
-                    ),
-                    source,
-                ),
+                CREATE INDEX IF NOT EXISTS idx_first_seen
+                ON sites(first_seen)
+                """
             )
+            conn.commit()
 
-            self.conn.commit()
-            return True
+    async def add(self, domain: str, technology: str, source: str) -> bool:
+        async with self.lock:
+            def _query():
+                try:
+                    with self._get_connection() as conn:
+                        conn.execute(
+                            """
+                            INSERT INTO sites (domain, technology, first_seen, source)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                domain,
+                                technology,
+                                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                source,
+                            ),
+                        )
+                        conn.commit()
+                        return True
+                except sqlite3.IntegrityError:
+                    return False
 
-        except sqlite3.IntegrityError:
-            return False
+            return await asyncio.to_thread(_query)
 
-    def exists(self, domain: str) -> bool:
-        row = self.conn.execute(
-            """
-            SELECT 1
-            FROM sites
-            WHERE domain = ?
-            """,
-            (domain,),
-        ).fetchone()
+    async def exists(self, domain: str) -> bool:
+        def _query():
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM sites WHERE domain = ?", (domain,)
+                ).fetchone()
+                return row is not None
 
-        return row is not None
+        return await asyncio.to_thread(_query)
 
-    def get_first_seen(self, domain: str) -> str:
-        row = self.conn.execute(
-            """
-            SELECT first_seen
-            FROM sites
-            WHERE domain = ?
-            """,
-            (domain,),
-        ).fetchone()
+    async def get_first_seen(self, domain: str) -> str:
+        def _query():
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT first_seen FROM sites WHERE domain = ?", (domain,)
+                ).fetchone()
+                return row["first_seen"] if row else ""
 
-        return row["first_seen"] if row else ""
+        return await asyncio.to_thread(_query)
 
-    def stats(self) -> dict:
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM sites"
-        ).fetchone()[0]
+    async def stats(self) -> dict:
+        def _query():
+            with self._get_connection() as conn:
+                total = conn.execute("SELECT COUNT(*) FROM sites").fetchone()[0]
 
-        by_tech = dict(
-            self.conn.execute(
-                """
-                SELECT technology, COUNT(*)
-                FROM sites
-                GROUP BY technology
-                """
-            ).fetchall()
-        )
+                by_tech = dict(
+                    conn.execute(
+                        "SELECT technology, COUNT(*) FROM sites GROUP BY technology"
+                    ).fetchall()
+                )
 
-        by_source = dict(
-            self.conn.execute(
-                """
-                SELECT source, COUNT(*)
-                FROM sites
-                GROUP BY source
-                """
-            ).fetchall()
-        )
+                by_source = dict(
+                    conn.execute(
+                        "SELECT source, COUNT(*) FROM sites GROUP BY source"
+                    ).fetchall()
+                )
 
+                cutoff = (
+                    datetime.now(timezone.utc) - timedelta(days=1)
+                ).isoformat(timespec="seconds")
+
+                last24 = conn.execute(
+                    "SELECT COUNT(*) FROM sites WHERE first_seen >= ?", (cutoff,)
+                ).fetchone()[0]
+
+                return {
+                    "total": total,
+                    "by_tech": by_tech,
+                    "by_source": by_source,
+                    "last24": last24,
+                }
+
+        return await asyncio.to_thread(_query)
+
+    async def latest(self, hours: int = 24, limit: int = 30) -> list[dict]:
         cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(days=1)
+            datetime.now(timezone.utc) - timedelta(hours=hours)
         ).isoformat(timespec="seconds")
 
-        last24 = self.conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM sites
-            WHERE first_seen >= ?
-            """,
-            (cutoff,),
-        ).fetchone()[0]
+        def _query():
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT domain, technology, source, first_seen
+                    FROM sites
+                    WHERE first_seen >= ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
 
-        return {
-            "total": total,
-            "by_tech": by_tech,
-            "by_source": by_source,
-            "last24": last24,
-        }
+        return await asyncio.to_thread(_query)
 
-    def latest(
-        self,
-        hours: int = 24,
-        limit: int = 50,
-    ) -> list[sqlite3.Row]:
-
-        cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=hours)
-        ).isoformat(timespec="seconds")
-
-        return self.conn.execute(
-            """
-            SELECT *
-            FROM sites
-            WHERE first_seen >= ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (cutoff, limit),
-        ).fetchall()
-
-    def search(
-        self,
-        query: str,
-        limit: int = 30,
-    ) -> list[sqlite3.Row]:
-
+    async def search(self, query: str, limit: int = 25) -> list[dict]:
         like = f"%{query.lower()}%"
 
-        return self.conn.execute(
-            """
-            SELECT *
-            FROM sites
-            WHERE
-                lower(domain) LIKE ?
-                OR lower(technology) LIKE ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (like, like, limit),
-        ).fetchall()
+        def _query():
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT domain, technology, source, first_seen
+                    FROM sites
+                    WHERE lower(domain) LIKE ? OR lower(technology) LIKE ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (like, like, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
+
+        return await asyncio.to_thread(_query)
 
 
 db = DB(config.DB_PATH)
 
 
 # ============================================================
-# BUILTWITH
+# BUILTWITH CLIENT
 # ============================================================
 
-def fetch_builtwith(
-    technology: str,
-    since: str | None = None,
-) -> list[str]:
-
-    if not config.BUILTWITH_KEY:
-        log.warning(
-            "BUILTWITH_KEY is not configured"
-        )
+def fetch_builtwith(technology: str, since: str | None = None) -> list[str]:
+    if not getattr(config, "BUILTWITH_KEY", None):
+        log.warning("BUILTWITH_KEY is not configured")
         return []
 
-    since = since or config.BUILTWITH_SINCE
+    since = since or getattr(config, "BUILTWITH_SINCE", "yesterday")
 
     try:
         response = request_with_backoff(
@@ -319,88 +264,55 @@ def fetch_builtwith(
             "https://api.builtwith.com/change1/api.json",
             params={
                 "KEY": config.BUILTWITH_KEY,
-                "LOOKUP": f"{technology}.com",
+                "TECH": technology,
                 "SINCE": since.replace(" ", "+"),
             },
             timeout=45,
-            max_retries=config.MAX_RETRIES,
+            max_retries=getattr(config, "MAX_RETRIES", 3),
         )
-
         data = response.json()
 
     except (RateLimitError, Exception) as exc:
-        log.warning(
-            "BuiltWith %s failed: %s",
-            technology,
-            exc,
-        )
+        log.warning("BuiltWith %s failed: %s", technology, exc)
         return []
 
     found: list[str] = []
 
     def walk(node):
         if isinstance(node, dict):
-
             for key in ("Domain", "D", "domain"):
-                value = node.get(key)
-
-                if isinstance(value, str):
-                    domain = clean_domain(value)
-
-                    if domain:
-                        found.append(domain)
-
-            for value in node.values():
-                walk(value)
-
+                val = node.get(key)
+                if isinstance(val, str):
+                    cleaned = clean_domain(val)
+                    if cleaned:
+                        found.append(cleaned)
+            for v in node.values():
+                walk(v)
         elif isinstance(node, list):
-
-            for value in node:
-                walk(value)
+            for item in node:
+                walk(item)
 
     walk(data)
 
-    result = list(dict.fromkeys(found))
-
-    log.info(
-        "BuiltWith %s — %s domains",
-        technology,
-        len(result),
-    )
-
-    return result[:config.MAX_PER_SOURCE]
+    unique_domains = list(dict.fromkeys(found))
+    max_domains = getattr(config, "MAX_PER_SOURCE", 100)
+    log.info("BuiltWith %s — %d domains", technology, len(unique_domains))
+    return unique_domains[:max_domains]
 
 
-# ============================================================
-# SOURCE SCANNER
-# ============================================================
-
-def run_sources(
-    technology: str,
-) -> list[tuple[str, str]]:
-
-    results: list[tuple[str, str]] = []
-
+def run_sources(technology: str) -> list[tuple[str, str]]:
+    results = []
     try:
         domains = fetch_builtwith(technology)
-
-        for domain in domains:
-            results.append(
-                (domain, "BuiltWith")
-            )
-
+        for d in domains:
+            results.append((d, "BuiltWith"))
     except Exception as exc:
-        log.exception(
-            "BuiltWith crashed for %s: %s",
-            technology,
-            exc,
-        )
-
+        log.exception("BuiltWith crashed for %s: %s", technology, exc)
     return results
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM BOT CLIENT
 # ============================================================
 
 app = Client(
@@ -411,77 +323,12 @@ app = Client(
 )
 
 
-# ============================================================
-# TARGET CHAT
-# ============================================================
-
-async def resolve_target_chat():
-    """
-    Resolve TARGET_CHANNEL/TARGET_GROUP at startup.
-
-    This catches invalid private-group IDs before scanning.
-    """
-
-    if not config.TARGET_CHANNEL:
-        log.info(
-            "TARGET_CHANNEL not configured."
-        )
-        return None
-
-    try:
-        chat = await app.get_chat(
-            config.TARGET_CHANNEL
-        )
-
-        log.info(
-            "Target resolved | title=%s | id=%s | type=%s",
-            chat.title or chat.first_name or "unknown",
-            chat.id,
-            chat.type,
-        )
-
-        return chat.id
-
-    except Exception as exc:
-        log.error(
-            "TARGET_CHANNEL cannot be resolved: %s",
-            exc,
-        )
-
-        return None
+def escape_markdown(text: str) -> str:
+    """Escapes Telegram legacy markdown reserved characters."""
+    return re.sub(r"([_*`\[\]])", r"\\\1", text)
 
 
-# ============================================================
-# FORMAT
-# ============================================================
-
-def format_hit(
-    domain: str,
-    technology: str,
-    first_seen: str,
-    source: str,
-) -> str:
-
-    return (
-        "🆕 **New site detected**\n\n"
-        f"🌐 **Domain:** `{domain}`\n"
-        f"🧩 **Technology:** {technology.capitalize()}\n"
-        f"📅 **Detected:** "
-        f"{first_seen.replace('T', ' ')} UTC\n"
-        f"🔎 **Source:** {source}\n"
-        f"🔗 https://{domain}"
-    )
-
-
-# ============================================================
-# SEND SAFELY
-# ============================================================
-
-async def safe_send(
-    chat_id,
-    text: str,
-) -> bool:
-
+async def safe_send(chat_id: int | str, text: str) -> bool:
     try:
         await app.send_message(
             chat_id,
@@ -489,231 +336,138 @@ async def safe_send(
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
-
         return True
-
+    except FloodWait as e:
+        log.warning("Telegram FloodWait: sleeping for %d seconds", e.value)
+        await asyncio.sleep(e.value + 1)
+        try:
+            await app.send_message(
+                chat_id,
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            return True
+        except Exception:
+            return False
+    except RPCError as exc:
+        log.error("Telegram RPCError | chat=%s | error=%s", chat_id, exc)
+        return False
     except Exception as exc:
-        log.error(
-            "Telegram send failed | chat=%s | error=%s",
-            chat_id,
-            exc,
-        )
-
+        log.error("Telegram unexpected send failed | chat=%s | error=%s", chat_id, exc)
         return False
 
 
-# ============================================================
-# SCAN
-# ============================================================
-
-async def scan_and_forward(
-    notify_chat=None,
-) -> int:
-
-    new_count = 0
-
-    target_ids: list[int | str] = []
-
-    # Configured target
-    if config.TARGET_CHANNEL:
-        target_ids.append(
-            config.TARGET_CHANNEL
-        )
-
-    # If /scan was executed in a group/private chat,
-    # also send the results there.
-    if notify_chat and notify_chat not in target_ids:
-        target_ids.append(
-            notify_chat
-        )
-
-    log.info(
-        "Scan started | targets=%s",
-        target_ids,
+def format_hit(domain: str, technology: str, first_seen: str, source: str) -> str:
+    # Safely escape text values in case they contain markdown syntax
+    clean_first_seen = first_seen.replace("T", " ")
+    return (
+        "🆕 **New site detected**\n\n"
+        f"🌐 **Domain:** `{domain}`\n"
+        f"🧩 **Technology:** {escape_markdown(technology.capitalize())}\n"
+        f"📅 **Detected:** `{clean_first_seen} UTC`\n"
+        f"🔎 **Source:** {escape_markdown(source)}\n"
+        f"🔗 https://{domain}"
     )
 
-    for technology in config.TECHNOLOGIES:
 
-        log.info(
-            "Scanning %s...",
-            technology,
-        )
+# ============================================================
+# SCAN LOGIC
+# ============================================================
 
-        hits = await asyncio.to_thread(
-            run_sources,
-            technology,
-        )
+scan_lock = asyncio.Lock()
 
-        log.info(
-            "%s returned %s results",
-            technology,
-            len(hits),
-        )
+async def scan_and_forward(notify_chat: int | str | None = None) -> int:
+    if scan_lock.locked():
+        log.info("A scan is already in progress. Skipping concurrent run.")
+        return 0
 
-        for domain, source in hits:
+    async with scan_lock:
+        new_count = 0
+        target_ids: list[int | str] = []
 
-            if db.exists(domain):
-                continue
+        if getattr(config, "TARGET_CHANNEL", None):
+            target_ids.append(config.TARGET_CHANNEL)
 
-            if not db.add(
-                domain,
-                technology,
-                source,
-            ):
-                continue
+        if notify_chat and notify_chat not in target_ids:
+            target_ids.append(notify_chat)
 
-            new_count += 1
+        log.info("Scan started | targets=%s", target_ids)
 
-            first_seen = db.get_first_seen(
-                domain
-            )
+        for technology in getattr(config, "TECHNOLOGIES", ["shopify", "stripe"]):
+            log.info("Scanning %s...", technology)
+            hits = await asyncio.to_thread(run_sources, technology)
 
-            text = format_hit(
-                domain,
-                technology,
-                first_seen,
-                source,
-            )
+            for domain, source in hits:
+                if await db.exists(domain):
+                    continue
 
-            for target in target_ids:
-                await safe_send(
-                    target,
-                    text,
-                )
+                if not await db.add(domain, technology, source):
+                    continue
 
-            await asyncio.sleep(1.0)
+                new_count += 1
+                first_seen = await db.get_first_seen(domain)
+                text = format_hit(domain, technology, first_seen, source)
 
-    log.info(
-        "scan complete — %s new domains",
-        new_count,
-    )
+                for target in target_ids:
+                    await safe_send(target, text)
+                    await asyncio.sleep(0.5)
 
-    return new_count
+        log.info("Scan complete — %d new domains", new_count)
+        return new_count
 
 
 # ============================================================
-# START
+# TELEGRAM COMMAND HANDLERS
 # ============================================================
 
-@app.on_message(
-    filters.private & filters.command("start")
-)
-async def cmd_start(
-    _,
-    message: Message,
-):
-
-    log.info(
-        "START received | user=%s | chat=%s",
-        message.from_user.id
-        if message.from_user
-        else "unknown",
-        message.chat.id,
-    )
-
+@app.on_message(filters.private & filters.command("start"))
+async def cmd_start(_, message: Message):
     await message.reply_text(
         "✅ **Site Hunter is online.**\n\n"
-        "🔎 Shopify + Stripe discovery is active.\n\n"
+        "🔎 Active technology discovery.\n\n"
         "**Commands**\n"
-        "/scan — start a scan\n"
-        "/stats — statistics\n"
-        "/latest — latest sites\n"
-        "/search `<query>` — search database",
+        "• `/scan` — Trigger scan immediately\n"
+        "• `/stats` — View stored database stats\n"
+        "• `/latest` — View recent discoveries\n"
+        "• `/search <query>` — Search stored domains",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# ============================================================
-# GROUP MESSAGE LOGGER
-# ============================================================
+@app.on_message(filters.command("stats"))
+async def cmd_stats(_, message: Message):
+    stats = await db.stats()
 
-@app.on_message(
-    filters.group
-)
-async def group_activity(
-    _,
-    message: Message,
-):
+    tech = "\n".join(
+        f"• {escape_markdown(k.capitalize())}: **{v}**" for k, v in stats["by_tech"].items()
+    ) or "• None"
 
-    log.info(
-        "GROUP UPDATE | title=%s | chat_id=%s",
-        message.chat.title,
-        message.chat.id,
-    )
-
-
-# ============================================================
-# STATS
-# ============================================================
-
-@app.on_message(
-    filters.command("stats")
-)
-async def cmd_stats(
-    _,
-    message: Message,
-):
-
-    stats = db.stats()
-
-    tech = (
-        "\n".join(
-            f"• {k.capitalize()}: {v}"
-            for k, v in stats["by_tech"].items()
-        )
-        or "• none"
-    )
-
-    source = (
-        "\n".join(
-            f"• {k}: {v}"
-            for k, v in stats["by_source"].items()
-        )
-        or "• none"
-    )
+    source = "\n".join(
+        f"• {escape_markdown(k)}: **{v}**" for k, v in stats["by_source"].items()
+    ) or "• None"
 
     await message.reply_text(
-        f"📊 **Stats**\n\n"
-        f"Total: **{stats['total']}**\n"
-        f"Last 24h: **{stats['last24']}**\n\n"
-        f"**Technology**\n{tech}\n\n"
-        f"**Source**\n{source}",
+        f"📊 **Database Statistics**\n\n"
+        f"Total Sites: **{stats['total']}**\n"
+        f"Added in last 24h: **{stats['last24']}**\n\n"
+        f"**By Technology:**\n{tech}\n\n"
+        f"**By Source:**\n{source}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# ============================================================
-# LATEST
-# ============================================================
-
-@app.on_message(
-    filters.command("latest")
-)
-async def cmd_latest(
-    _,
-    message: Message,
-):
-
-    rows = db.latest(
-        hours=24,
-        limit=40,
-    )
-
+@app.on_message(filters.command("latest"))
+async def cmd_latest(_, message: Message):
+    rows = await db.latest(hours=24, limit=25)
     if not rows:
-        await message.reply_text(
-            "No sites found in the last 24 hours."
-        )
+        await message.reply_text("No sites discovered in the last 24 hours.")
         return
 
-    lines = [
-        f"🕒 **Last 24 hours ({len(rows)})**\n"
-    ]
-
+    lines = [f"🕒 **Last 24 Hours ({len(rows)} sites)**\n"]
     for row in rows:
         lines.append(
-            f"• `{row['domain']}` — "
-            f"{row['technology'].capitalize()} · "
-            f"{row['source']}"
+            f"• `{row['domain']}` — {escape_markdown(row['technology'].capitalize())} ({escape_markdown(row['source'])})"
         )
 
     await message.reply_text(
@@ -723,52 +477,31 @@ async def cmd_latest(
     )
 
 
-# ============================================================
-# SEARCH
-# ============================================================
-
-@app.on_message(
-    filters.command("search")
-)
-async def cmd_search(
-    _,
-    message: Message,
-):
-
-    parts = message.text.split(
-        maxsplit=1
-    )
-
+@app.on_message(filters.command("search"))
+async def cmd_search(_, message: Message):
+    parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         await message.reply_text(
-            "Usage:\n"
-            "/search shopify\n"
-            "/search stripe\n"
-            "/search example.com"
+            "**Usage:** `/search <domain or technology>`\n*Example:* `/search shopify`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     query = parts[1].strip()
-
-    rows = db.search(query)
+    rows = await db.search(query, limit=25)
 
     if not rows:
         await message.reply_text(
-            f"No stored results for `{query}`.",
+            f"No records found matching `{escape_markdown(query)}`.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    lines = [
-        f"🔎 **Results for `{query}`**\n"
-    ]
-
+    lines = [f"🔎 **Results for `{escape_markdown(query)}` ({len(rows)})**\n"]
     for row in rows:
+        first_date = row["first_seen"][:10] if row.get("first_seen") else "Unknown"
         lines.append(
-            f"• `{row['domain']}` — "
-            f"{row['technology'].capitalize()} · "
-            f"{row['source']} · "
-            f"{row['first_seen'][:10]}"
+            f"• `{row['domain']}` — {escape_markdown(row['technology'].capitalize())} (`{first_date}`)"
         )
 
     await message.reply_text(
@@ -778,121 +511,65 @@ async def cmd_search(
     )
 
 
-# ============================================================
-# SCAN COMMAND
-# ============================================================
+@app.on_message(filters.command("scan"))
+async def cmd_scan(_, message: Message):
+    if scan_lock.locked():
+        await message.reply_text("⚠️ A scan is already running. Please wait for it to finish.")
+        return
 
-@app.on_message(
-    filters.command("scan")
-)
-async def cmd_scan(
-    _,
-    message: Message,
-):
-
-    # Immediate confirmation
     status = await message.reply_text(
-        "🚀 **Scan started!**\n\n"
-        "🔎 Checking Shopify + Stripe...\n"
-        "⏳ Please wait...",
+        "🚀 **Scan initiated!**\n⏳ Searching configured sources...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-
-        count = await scan_and_forward(
-            notify_chat=message.chat.id
-        )
-
+        count = await scan_and_forward(notify_chat=message.chat.id)
         await status.edit_text(
-            "✅ **Scan finished!**\n\n"
-            f"🆕 New sites: **{count}**",
+            f"✅ **Scan finished!**\n🆕 New sites added: **{count}**",
             parse_mode=ParseMode.MARKDOWN,
         )
-
     except Exception as exc:
-
-        log.exception(
-            "Manual scan failed"
-        )
-
+        log.exception("Manual scan error: %s", exc)
         await status.edit_text(
-            "❌ **Scan failed.**\n\n"
-            "Check Railway logs for details.",
+            "❌ **Scan failed.** Check application server logs.",
             parse_mode=ParseMode.MARKDOWN,
         )
 
 
 # ============================================================
-# MAIN
+# RUNNER & BACKGROUND TASKS
 # ============================================================
 
-async def main():
-
-    missing = config.validate()
-
-    if missing:
-        raise SystemExit(
-            "Missing required environment variables: "
-            + ", ".join(missing)
-        )
-
-    await app.start()
-
-    me = await app.get_me()
-
-    log.info(
-        "Bot started as @%s",
-        me.username,
-    )
-
-    # Resolve target immediately.
-    target = await resolve_target_chat()
-
-    if target is None and config.TARGET_CHANNEL:
-        log.warning(
-            "Configured TARGET_CHANNEL could not be resolved."
-        )
-
-    log.info(
-        "Telegram update handlers are active."
-    )
-
-    # Background scanner
-    asyncio.create_task(
-        auto_loop()
-    )
-
-    # Keep process alive
-    await asyncio.Event().wait()
-
-
-# ============================================================
-# AUTO LOOP
-# ============================================================
+background_tasks = set()
 
 async def auto_loop():
-
+    interval = getattr(config, "SCAN_INTERVAL", 3600)
     while True:
-
         try:
-
             await scan_and_forward()
-
         except Exception:
-
-            log.exception(
-                "Automatic scan cycle failed"
-            )
-
-        await asyncio.sleep(
-            config.SCAN_INTERVAL
-        )
+            log.exception("Automatic periodic scan failed")
+        await asyncio.sleep(interval)
 
 
-# ============================================================
-# ENTRYPOINT
-# ============================================================
+async def main():
+    if hasattr(config, "validate"):
+        missing = config.validate()
+        if missing:
+            raise SystemExit("Missing configuration keys: " + ", ".join(missing))
+
+    await app.start()
+    me = await app.get_me()
+    log.info("Bot started successfully as @%s", me.username)
+
+    # Maintain a strong reference to prevent GC
+    loop_task = asyncio.create_task(auto_loop())
+    background_tasks.add(loop_task)
+    loop_task.add_done_callback(background_tasks.discard)
+
+    # Keep alive
+    await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
