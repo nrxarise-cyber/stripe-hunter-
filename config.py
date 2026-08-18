@@ -10,39 +10,96 @@ def _int(name: str, default: int = 0) -> int:
         return default
 
 
-# Telegram
+# ============================================================
+# TELEGRAM
+# ============================================================
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_ID = _int("API_ID")
 API_HASH = os.environ.get("API_HASH", "")
+
+# Example:
+# @mychannel
+# or
+# -1001234567890
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "")
 
 
-# Data sources
+# ============================================================
+# DATA SOURCES
+# ============================================================
+
+# BuiltWith Change API
 BUILTWITH_KEY = os.environ.get("BUILTWITH_KEY", "")
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
+
+# ============================================================
+# RUNTIME
+# ============================================================
+
+# SQLite database
+DB_PATH = os.environ.get(
+    "DB_PATH",
+    "sites.db",
+)
+
+# Automatic scan interval.
+# 3600 = 1 hour
+SCAN_INTERVAL = _int(
+    "SCAN_INTERVAL",
+    3600,
+)
+
+# BuiltWith lookback window
+BUILTWITH_SINCE = os.environ.get(
+    "BUILTWITH_SINCE",
+    "last day",
+)
+
+# Maximum results collected from each source
+MAX_PER_SOURCE = _int(
+    "MAX_PER_SOURCE",
+    40,
+)
 
 
-# Runtime
-DB_PATH = os.environ.get("DB_PATH", "sites.db")
-SCAN_INTERVAL = _int("SCAN_INTERVAL", 3600)
-BUILTWITH_SINCE = os.environ.get("BUILTWITH_SINCE", "last day")
-MAX_PER_SOURCE = _int("MAX_PER_SOURCE", 40)
+# ============================================================
+# RATE LIMITS
+# ============================================================
+
+BUILTWITH_RPM = _int(
+    "BUILTWITH_RPM",
+    10,
+)
+
+CRTSH_RPM = _int(
+    "CRTSH_RPM",
+    10,
+)
+
+MAX_RETRIES = _int(
+    "MAX_RETRIES",
+    5,
+)
 
 
-# Rate limits
-BUILTWITH_RPM = _int("BUILTWITH_RPM", 10)
-GOOGLE_RPM = _int("GOOGLE_RPM", 30)
-CRTSH_RPM = _int("CRTSH_RPM", 10)
+# ============================================================
+# TARGET TECHNOLOGIES
+# ============================================================
 
-MAX_RETRIES = _int("MAX_RETRIES", 5)
+TECHNOLOGIES = (
+    "shopify",
+    "stripe",
+)
 
 
-TECHNOLOGIES = ("shopify", "stripe")
-
+# ============================================================
+# VALIDATION
+# ============================================================
 
 def validate() -> list[str]:
+    """Return a list of missing required settings."""
+
     missing = []
 
     if not BOT_TOKEN:
