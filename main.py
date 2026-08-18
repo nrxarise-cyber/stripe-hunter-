@@ -1,32 +1,46 @@
 """
-Shopify / Stripe site-hunter Telegram bot.
+Shopify / Stripe Site Hunter Telegram Bot.
 
 Sources:
-- BuiltWith Change API
-- Google Programmable Search
-- Certificate Transparency via crt.sh
+    1. BuiltWith Change API
+    2. Certificate Transparency via crt.sh
 
-Commands:
-    /start
-    /stats
-    /search <query>
-    /latest
-    /scan
+The bot:
+    - discovers Shopify / Stripe related domains
+    - removes duplicates
+    - stores results in SQLite
+    - forwards new domains to Telegram
+    - supports manual scans and searches
 """
+
 
 import asyncio
 import logging
 import re
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
+
 from urllib.parse import urlparse
 
-from pyrogram import Client, filters
+
+from pyrogram import (
+    Client,
+    filters,
+)
+
 from pyrogram.enums import ParseMode
+
 from pyrogram.types import Message
 
+
 import config
+
 from ratelimit import (
     RateLimiter,
     RateLimitError,
@@ -34,18 +48,27 @@ from ratelimit import (
 )
 
 
-# --------------------------------------------------------------------------
-# Rate limiters
-# --------------------------------------------------------------------------
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+log = logging.getLogger(
+    "sitehunter"
+)
+
+
+# ============================================================
+# RATE LIMITERS
+# ============================================================
 
 BUILTWITH_LIMITER = RateLimiter(
     "BuiltWith",
     config.BUILTWITH_RPM,
-)
-
-GOOGLE_LIMITER = RateLimiter(
-    "Google",
-    config.GOOGLE_RPM,
 )
 
 CRTSH_LIMITER = RateLimiter(
@@ -54,27 +77,27 @@ CRTSH_LIMITER = RateLimiter(
 )
 
 
-# --------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-log = logging.getLogger("sitehunter")
-
-
-# --------------------------------------------------------------------------
-# Domain helpers
-# --------------------------------------------------------------------------
+# ============================================================
+# DOMAIN VALIDATION
+# ============================================================
 
 DOMAIN_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$"
+    r"^(?:"
+    r"[a-z0-9]"
+    r"(?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"\.)+"
+    r"[a-z]{2,}$"
 )
 
 
+# These are platforms / large services.
+# We don't want their own domains in our results.
+#
+# IMPORTANT:
+# myshopify.com is intentionally NOT here.
+# We want to allow:
+# example.myshopify.com
+#
 SKIP_HOSTS = (
     "shopify.com",
     "stripe.com",
@@ -86,22 +109,29 @@ SKIP_HOSTS = (
     "reddit.com",
     "wikipedia.org",
     "github.com",
-    "myshopify.com",
     "linkedin.com",
     "instagram.com",
     "pinterest.com",
 )
 
 
-def clean_domain(value: str) -> str | None:
+def clean_domain(
+    value: str,
+) -> str | None:
+
     if not value:
         return None
 
     value = value.strip().lower()
 
+    # Remove protocol
     if "://" in value:
-        value = urlparse(value).netloc or value
+        value = (
+            urlparse(value).netloc
+            or value
+        )
 
+    # Remove path/query/port
     value = (
         value
         .split("/")[0]
@@ -109,17 +139,22 @@ def clean_domain(value: str) -> str | None:
         .split(":")[0]
     )
 
+    # Remove www
     if value.startswith("www."):
         value = value[4:]
 
+    # Remove wildcard
     if value.startswith("*."):
         value = value[2:]
 
+    # Validate domain
     if not DOMAIN_RE.match(value):
         return None
 
+    # Skip unwanted platforms
     if any(
-        value == host or value.endswith("." + host)
+        value == host
+        or value.endswith("." + host)
         for host in SKIP_HOSTS
     ):
         return None
@@ -127,12 +162,17 @@ def clean_domain(value: str) -> str | None:
     return value
 
 
-# --------------------------------------------------------------------------
-# Database
-# --------------------------------------------------------------------------
+# ============================================================
+# DATABASE
+# ============================================================
 
 class DB:
-    def __init__(self, path: str):
+
+    def __init__(
+        self,
+        path: str,
+    ):
+
         self.conn = sqlite3.connect(
             path,
             check_same_thread=False,
@@ -143,23 +183,31 @@ class DB:
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sites (
+
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+
                 domain TEXT NOT NULL UNIQUE,
+
                 technology TEXT NOT NULL,
+
                 first_seen TEXT NOT NULL,
+
                 source TEXT NOT NULL
+
             )
             """
         )
 
         self.conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_first_seen
+            CREATE INDEX IF NOT EXISTS
+            idx_first_seen
             ON sites(first_seen)
             """
         )
 
         self.conn.commit()
+
 
     def add(
         self,
@@ -169,16 +217,24 @@ class DB:
     ) -> bool:
 
         try:
+
             self.conn.execute(
                 """
                 INSERT INTO sites
-                (domain, technology, first_seen, source)
+                (
+                    domain,
+                    technology,
+                    first_seen,
+                    source
+                )
                 VALUES (?, ?, ?, ?)
                 """,
                 (
                     domain,
                     technology,
-                    datetime.now(timezone.utc).isoformat(
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat(
                         timespec="seconds"
                     ),
                     source,
@@ -186,48 +242,76 @@ class DB:
             )
 
             self.conn.commit()
+
             return True
 
         except sqlite3.IntegrityError:
+
             return False
 
-    def exists(self, domain: str) -> bool:
-        cur = self.conn.execute(
-            "SELECT 1 FROM sites WHERE domain = ?",
+
+    def exists(
+        self,
+        domain: str,
+    ) -> bool:
+
+        result = self.conn.execute(
+            """
+            SELECT 1
+            FROM sites
+            WHERE domain = ?
+            """,
             (domain,),
         )
 
-        return cur.fetchone() is not None
+        return result.fetchone() is not None
+
 
     def stats(self) -> dict:
+
         total = self.conn.execute(
-            "SELECT COUNT(*) FROM sites"
+            """
+            SELECT COUNT(*)
+            FROM sites
+            """
         ).fetchone()[0]
+
 
         by_tech = dict(
             self.conn.execute(
                 """
-                SELECT technology, COUNT(*)
+                SELECT
+                    technology,
+                    COUNT(*)
                 FROM sites
                 GROUP BY technology
                 """
             ).fetchall()
         )
 
+
         by_source = dict(
             self.conn.execute(
                 """
-                SELECT source, COUNT(*)
+                SELECT
+                    source,
+                    COUNT(*)
                 FROM sites
                 GROUP BY source
                 """
             ).fetchall()
         )
 
+
         cutoff = (
-            datetime.now(timezone.utc)
+            datetime.now(
+                timezone.utc
+            )
             - timedelta(days=1)
-        ).isoformat(timespec="seconds")
+        ).isoformat(
+            timespec="seconds"
+        )
+
 
         last24 = self.conn.execute(
             """
@@ -238,12 +322,14 @@ class DB:
             (cutoff,),
         ).fetchone()[0]
 
+
         return {
             "total": total,
             "by_tech": by_tech,
             "by_source": by_source,
             "last24": last24,
         }
+
 
     def latest(
         self,
@@ -252,9 +338,16 @@ class DB:
     ) -> list[sqlite3.Row]:
 
         cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=hours)
-        ).isoformat(timespec="seconds")
+            datetime.now(
+                timezone.utc
+            )
+            - timedelta(
+                hours=hours
+            )
+        ).isoformat(
+            timespec="seconds"
+        )
+
 
         return self.conn.execute(
             """
@@ -264,8 +357,12 @@ class DB:
             ORDER BY id DESC
             LIMIT ?
             """,
-            (cutoff, limit),
+            (
+                cutoff,
+                limit,
+            ),
         ).fetchall()
+
 
     def search(
         self,
@@ -273,27 +370,40 @@ class DB:
         limit: int = 30,
     ) -> list[sqlite3.Row]:
 
-        like = f"%{query.lower()}%"
+        like = (
+            "%"
+            + query.lower()
+            + "%"
+        )
+
 
         return self.conn.execute(
             """
             SELECT *
             FROM sites
-            WHERE lower(domain) LIKE ?
-               OR lower(technology) LIKE ?
+            WHERE
+                lower(domain) LIKE ?
+                OR
+                lower(technology) LIKE ?
             ORDER BY id DESC
             LIMIT ?
             """,
-            (like, like, limit),
+            (
+                like,
+                like,
+                limit,
+            ),
         ).fetchall()
 
 
-db = DB(config.DB_PATH)
+db = DB(
+    config.DB_PATH
+)
 
 
-# --------------------------------------------------------------------------
-# BuiltWith
-# --------------------------------------------------------------------------
+# ============================================================
+# BUILTWITH
+# ============================================================
 
 def fetch_builtwith(
     technology: str,
@@ -301,42 +411,70 @@ def fetch_builtwith(
 ) -> list[str]:
 
     if not config.BUILTWITH_KEY:
+
         log.info(
-            "BuiltWith skipped: BUILTWITH_KEY not configured"
+            "BuiltWith skipped: "
+            "BUILTWITH_KEY not configured"
         )
+
         return []
 
-    since = since or config.BUILTWITH_SINCE
+
+    since = (
+        since
+        or config.BUILTWITH_SINCE
+    )
+
 
     try:
+
         response = request_with_backoff(
             BUILTWITH_LIMITER,
             "GET",
             "https://api.builtwith.com/change1/api.json",
             params={
                 "KEY": config.BUILTWITH_KEY,
-                "LOOKUP": f"{technology}.com",
-                "SINCE": since.replace(" ", "+"),
+                "LOOKUP": (
+                    f"{technology}.com"
+                ),
+                "SINCE": (
+                    since.replace(
+                        " ",
+                        "+"
+                    )
+                ),
             },
             timeout=45,
             max_retries=config.MAX_RETRIES,
         )
 
+
         data = response.json()
 
-    except (RateLimitError, Exception) as exc:
+
+    except (
+        RateLimitError,
+        Exception,
+    ) as exc:
+
         log.warning(
             "BuiltWith %s failed: %s",
             technology,
             exc,
         )
+
         return []
+
 
     found = []
 
+
     def walk(node):
 
-        if isinstance(node, dict):
+        if isinstance(
+            node,
+            dict,
+        ):
 
             for key in (
                 "Domain",
@@ -344,31 +482,48 @@ def fetch_builtwith(
                 "domain",
             ):
 
+                value = node.get(
+                    key
+                )
+
+
                 if isinstance(
-                    node.get(key),
+                    value,
                     str,
                 ):
 
                     domain = clean_domain(
-                        node[key]
+                        value
                     )
 
                     if domain:
-                        found.append(domain)
+                        found.append(
+                            domain
+                        )
+
 
             for value in node.values():
                 walk(value)
 
-        elif isinstance(node, list):
+
+        elif isinstance(
+            node,
+            list,
+        ):
 
             for value in node:
                 walk(value)
 
+
     walk(data)
 
+
     result = list(
-        dict.fromkeys(found)
+        dict.fromkeys(
+            found
+        )
     )
+
 
     log.info(
         "BuiltWith %s — %s domains",
@@ -376,116 +531,26 @@ def fetch_builtwith(
         len(result),
     )
 
-    return result[:config.MAX_PER_SOURCE]
+
+    return result[
+        :config.MAX_PER_SOURCE
+    ]
 
 
-# --------------------------------------------------------------------------
-# Google
-# --------------------------------------------------------------------------
-
-GOOGLE_DORKS = {
-    "shopify": [
-        '"powered by shopify" -site:shopify.com',
-        'inurl:"/collections/all" "add to cart"',
-    ],
-    "stripe": [
-        '"checkout.stripe.com"',
-        '"powered by stripe" inurl:checkout',
-    ],
-}
-
-
-def fetch_google(
-    technology: str,
-    custom_query: str | None = None,
-) -> list[str]:
-
-    if not (
-        config.GOOGLE_API_KEY
-        and config.GOOGLE_CX
-    ):
-        log.info(
-            "Google skipped: API credentials not configured"
-        )
-        return []
-
-    queries = (
-        [custom_query]
-        if custom_query
-        else GOOGLE_DORKS.get(
-            technology,
-            [],
-        )
-    )
-
-    found = []
-
-    for query in queries:
-
-        try:
-
-            response = request_with_backoff(
-                GOOGLE_LIMITER,
-                "GET",
-                "https://www.googleapis.com/customsearch/v1",
-                params={
-                    "key": config.GOOGLE_API_KEY,
-                    "cx": config.GOOGLE_CX,
-                    "q": query,
-                    "num": 10,
-                    "dateRestrict": "w1",
-                },
-                timeout=30,
-                max_retries=config.MAX_RETRIES,
-            )
-
-            for item in response.json().get(
-                "items",
-                [],
-            ):
-
-                domain = clean_domain(
-                    item.get("link", "")
-                )
-
-                if domain:
-                    found.append(domain)
-
-        except (RateLimitError, Exception) as exc:
-
-            log.warning(
-                "Google dork failed (%s): %s",
-                query,
-                exc,
-            )
-
-        time.sleep(1)
-
-    result = list(
-        dict.fromkeys(found)
-    )
-
-    log.info(
-        "Google %s — %s domains",
-        technology,
-        len(result),
-    )
-
-    return result[:config.MAX_PER_SOURCE]
-
-
-# --------------------------------------------------------------------------
-# crt.sh / Certificate Transparency
-# --------------------------------------------------------------------------
+# ============================================================
+# CRT.SH
+# ============================================================
 
 CRTSH_QUERIES = {
+
     "shopify": [
-        "%.shopify.com",
         "%.myshopify.com",
     ],
+
     "stripe": [
         "%.stripe.com",
     ],
+
 }
 
 
@@ -495,18 +560,25 @@ def fetch_crtsh(
 ) -> list[str]:
 
     queries = (
+
         [custom_query]
+
         if custom_query
+
         else CRTSH_QUERIES.get(
             technology,
             [],
         )
+
     )
+
 
     if not queries:
         return []
 
+
     found = []
+
 
     for query in queries:
 
@@ -524,13 +596,16 @@ def fetch_crtsh(
                 max_retries=config.MAX_RETRIES,
             )
 
+
             data = response.json()
+
 
             if not isinstance(
                 data,
                 list,
             ):
                 continue
+
 
             for certificate in data:
 
@@ -540,10 +615,12 @@ def fetch_crtsh(
                 ):
                     continue
 
+
                 names = certificate.get(
                     "name_value",
                     "",
                 )
+
 
                 if not isinstance(
                     names,
@@ -551,14 +628,22 @@ def fetch_crtsh(
                 ):
                     continue
 
-                for name in names.splitlines():
+
+                for name in (
+                    names.splitlines()
+                ):
 
                     domain = clean_domain(
                         name
                     )
 
+
                     if domain:
-                        found.append(domain)
+
+                        found.append(
+                            domain
+                        )
+
 
         except (
             RateLimitError,
@@ -571,11 +656,16 @@ def fetch_crtsh(
                 exc,
             )
 
+
         time.sleep(1)
 
+
     result = list(
-        dict.fromkeys(found)
+        dict.fromkeys(
+            found
+        )
     )
+
 
     log.info(
         "crt.sh %s — %s domains",
@@ -583,12 +673,15 @@ def fetch_crtsh(
         len(result),
     )
 
-    return result[:config.MAX_PER_SOURCE]
+
+    return result[
+        :config.MAX_PER_SOURCE
+    ]
 
 
-# --------------------------------------------------------------------------
-# Source runner
-# --------------------------------------------------------------------------
+# ============================================================
+# SOURCE RUNNER
+# ============================================================
 
 def run_sources(
     technology: str,
@@ -596,11 +689,18 @@ def run_sources(
 
     results = []
 
+
     sources = (
-        ("BuiltWith", fetch_builtwith),
-        ("Google", fetch_google),
-        ("crt.sh", fetch_crtsh),
+        (
+            "BuiltWith",
+            fetch_builtwith,
+        ),
+        (
+            "crt.sh",
+            fetch_crtsh,
+        ),
     )
+
 
     for source, function in sources:
 
@@ -610,7 +710,9 @@ def run_sources(
                 technology
             )
 
+
             for domain in domains:
+
                 results.append(
                     (
                         domain,
@@ -618,20 +720,22 @@ def run_sources(
                     )
                 )
 
+
         except Exception as exc:
 
             log.exception(
-                "source %s crashed: %s",
+                "Source %s crashed: %s",
                 source,
                 exc,
             )
 
+
     return results
 
 
-# --------------------------------------------------------------------------
-# Telegram
-# --------------------------------------------------------------------------
+# ============================================================
+# TELEGRAM CLIENT
+# ============================================================
 
 app = Client(
     "sitehunter",
@@ -641,6 +745,10 @@ app = Client(
 )
 
 
+# ============================================================
+# TELEGRAM MESSAGE
+# ============================================================
+
 def format_hit(
     domain: str,
     technology: str,
@@ -649,16 +757,25 @@ def format_hit(
 ) -> str:
 
     return (
-        "🆕 **New site found**\n\n"
+        "🆕 **New site detected**\n\n"
+
         f"🌐 **Domain:** `{domain}`\n"
+
         f"🧩 **Technology:** "
         f"{technology.capitalize()}\n"
-        f"📅 **First seen:** "
+
+        f"📅 **Detected:** "
         f"{first_seen.replace('T', ' ')} UTC\n"
+
         f"🔎 **Source:** {source}\n"
+
         f"🔗 https://{domain}"
     )
 
+
+# ============================================================
+# SCAN
+# ============================================================
 
 async def scan_and_forward(
     notify_chat: int | str | None = None,
@@ -666,27 +783,39 @@ async def scan_and_forward(
 
     new_count = 0
 
+
     targets = [
         target
+
         for target in (
             config.TARGET_CHANNEL,
             notify_chat,
         )
+
         if target
     ]
 
-    for technology in config.TECHNOLOGIES:
+
+    for technology in (
+        config.TECHNOLOGIES
+    ):
 
         hits = await asyncio.to_thread(
             run_sources,
             technology,
         )
 
+
         for domain, source in hits:
 
-            if db.exists(domain):
+            # Already stored?
+            if db.exists(
+                domain
+            ):
                 continue
 
+
+            # Insert
             if not db.add(
                 domain,
                 technology,
@@ -694,7 +823,9 @@ async def scan_and_forward(
             ):
                 continue
 
+
             new_count += 1
+
 
             row = db.conn.execute(
                 """
@@ -705,12 +836,14 @@ async def scan_and_forward(
                 (domain,),
             ).fetchone()
 
+
             text = format_hit(
                 domain,
                 technology,
                 row["first_seen"],
                 source,
             )
+
 
             for target in targets:
 
@@ -719,34 +852,49 @@ async def scan_and_forward(
                     await app.send_message(
                         target,
                         text,
-                        parse_mode=ParseMode.MARKDOWN,
+                        parse_mode=(
+                            ParseMode.MARKDOWN
+                        ),
                         disable_web_page_preview=True,
                     )
+
 
                 except Exception as exc:
 
                     log.warning(
-                        "send to %s failed: %s",
+                        "Send to %s failed: %s",
                         target,
                         exc,
                     )
 
-            await asyncio.sleep(1.2)
+
+            # Avoid Telegram flood
+            await asyncio.sleep(
+                1.2
+            )
+
 
     log.info(
         "scan complete — %s new domains",
         new_count,
     )
 
+
     return new_count
 
+
+# ============================================================
+# AUTO SCANNER
+# ============================================================
 
 async def auto_loop():
 
     while True:
 
         try:
+
             await scan_and_forward()
+
 
         except Exception as exc:
 
@@ -755,35 +903,48 @@ async def auto_loop():
                 exc,
             )
 
+
         await asyncio.sleep(
             config.SCAN_INTERVAL
         )
 
 
-# --------------------------------------------------------------------------
-# Commands
-# --------------------------------------------------------------------------
+# ============================================================
+# HELP
+# ============================================================
 
 HELP = (
-    "💻 **Site Hunter Bot**\n"
-    "Finds Shopify & Stripe related sites "
-    "and forwards new domains to your channel.\n\n"
+    "💻 **Site Hunter Bot**\n\n"
+
+    "Finds Shopify & Stripe related "
+    "domains using public discovery sources.\n\n"
 
     "**Commands**\n"
-    "/start — this help menu\n"
-    "/stats — total sites found\n"
-    "/search `<query>` — search stored sites "
-    "or run a live lookup\n"
-    "/latest — sites found in the last 24 hours\n"
-    "/scan — trigger a scan right now\n\n"
 
-    "**Sources:** "
-    "BuiltWith · Google Dorks · Certificate Transparency\n"
+    "/start — Help\n"
 
-    "Auto-scan runs every "
-    f"{max(1, config.SCAN_INTERVAL // 60)} minutes, 24/7."
+    "/stats — Statistics\n"
+
+    "/search `<query>` — Search database\n"
+
+    "/latest — Last 24 hours\n"
+
+    "/scan — Run scan now\n\n"
+
+    "**Sources**\n"
+
+    "• BuiltWith\n"
+    "• crt.sh / Certificate Transparency\n\n"
+
+    "Auto-scan: every "
+    f"{max(1, config.SCAN_INTERVAL // 60)} "
+    "minutes."
 )
 
+
+# ============================================================
+# /START
+# ============================================================
 
 @app.on_message(
     filters.command("start")
@@ -800,6 +961,10 @@ async def cmd_start(
     )
 
 
+# ============================================================
+# /STATS
+# ============================================================
+
 @app.on_message(
     filters.command("stats")
 )
@@ -810,31 +975,57 @@ async def cmd_stats(
 
     stats = db.stats()
 
+
     tech = (
         "\n".join(
             f"  • {key.capitalize()}: {value}"
-            for key, value in stats["by_tech"].items()
+
+            for key, value
+            in stats[
+                "by_tech"
+            ].items()
         )
+
         or "  • none yet"
     )
+
 
     source = (
         "\n".join(
             f"  • {key}: {value}"
-            for key, value in stats["by_source"].items()
+
+            for key, value
+            in stats[
+                "by_source"
+            ].items()
         )
+
         or "  • none yet"
     )
 
+
     await message.reply_text(
         f"📊 **Stats**\n\n"
-        f"Total sites: **{stats['total']}**\n"
-        f"Last 24 hours: **{stats['last24']}**\n\n"
-        f"**By technology**\n{tech}\n\n"
-        f"**By source**\n{source}",
+
+        f"Total sites: "
+        f"**{stats['total']}**\n"
+
+        f"Last 24 hours: "
+        f"**{stats['last24']}**\n\n"
+
+        f"**By technology**\n"
+        f"{tech}\n\n"
+
+        f"**By source**\n"
+        f"{source}",
+
         parse_mode=ParseMode.MARKDOWN,
     )
 
+
+# ============================================================
+# /LATEST
+# ============================================================
 
 @app.on_message(
     filters.command("latest")
@@ -849,6 +1040,7 @@ async def cmd_latest(
         limit=40,
     )
 
+
     if not rows:
 
         await message.reply_text(
@@ -857,9 +1049,12 @@ async def cmd_latest(
 
         return
 
+
     lines = [
-        f"🕒 **Last 24 hours** ({len(rows)})\n"
+        f"🕒 **Last 24 hours** "
+        f"({len(rows)})\n"
     ]
+
 
     for row in rows:
 
@@ -869,12 +1064,17 @@ async def cmd_latest(
             f"{row['source']}"
         )
 
+
     await message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
 
+
+# ============================================================
+# /SEARCH
+# ============================================================
 
 @app.on_message(
     filters.command("search")
@@ -888,110 +1088,66 @@ async def cmd_search(
         maxsplit=1
     )
 
+
     if len(parts) < 2:
 
         await message.reply_text(
-            "Usage: `/search shopify` "
-            "or `/search mystore.com`",
+            "Usage:\n\n"
+            "`/search shopify`\n"
+            "`/search stripe`\n"
+            "`/search example.com`",
+
             parse_mode=ParseMode.MARKDOWN,
         )
 
         return
+
 
     query = parts[1].strip()
 
-    rows = db.search(query)
 
-    if rows:
+    rows = db.search(
+        query
+    )
 
-        lines = [
-            f"🔎 **Stored results for** "
-            f"`{query}`\n"
-        ]
 
-        for row in rows:
-
-            lines.append(
-                f"• `{row['domain']}` — "
-                f"{row['technology'].capitalize()} · "
-                f"{row['source']} · "
-                f"{row['first_seen'][:10]}"
-            )
+    if not rows:
 
         await message.reply_text(
-            "\n".join(lines),
+            f"🔎 No stored results for "
+            f"`{query}`.",
+
             parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
         )
 
         return
 
-    status = await message.reply_text(
-        f"🔎 No stored match. "
-        f"Running a live search for `{query}`…",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    tech = (
-        "stripe"
-        if "stripe" in query.lower()
-        else "shopify"
-    )
-
-    live = await asyncio.to_thread(
-        fetch_google,
-        tech,
-        query,
-    )
-
-    live += await asyncio.to_thread(
-        fetch_crtsh,
-        tech,
-        query,
-    )
-
-    live = list(
-        dict.fromkeys(live)
-    )[:25]
-
-    if not live:
-
-        await status.edit_text(
-            "Nothing found. "
-            "Check your Google configuration "
-            "or try another query."
-        )
-
-        return
-
-    added = [
-        domain
-        for domain in live
-        if db.add(
-            domain,
-            tech,
-            "Manual",
-        )
-    ]
 
     lines = [
-        f"🔎 **Live results for** "
-        f"`{query}` "
-        f"({len(live)} found, "
-        f"{len(added)} new)\n"
+        f"🔎 **Results for** `{query}`\n"
     ]
 
-    lines += [
-        f"• `{domain}`"
-        for domain in live
-    ]
 
-    await status.edit_text(
+    for row in rows:
+
+        lines.append(
+            f"• `{row['domain']}` — "
+            f"{row['technology'].capitalize()} · "
+            f"{row['source']} · "
+            f"{row['first_seen'][:10]}"
+        )
+
+
+    await message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
 
+
+# ============================================================
+# /SCAN
+# ============================================================
 
 @app.on_message(
     filters.command("scan")
@@ -1002,31 +1158,37 @@ async def cmd_scan(
 ):
 
     status = await message.reply_text(
-        "🚀 Scanning all sources…"
+        "🚀 Scanning BuiltWith + crt.sh..."
     )
+
 
     count = await scan_and_forward(
         notify_chat=(
             message.chat.id
+
             if not config.TARGET_CHANNEL
+
             else None
         )
     )
 
+
     await status.edit_text(
         f"✅ Scan finished — "
         f"**{count}** new sites.",
+
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# --------------------------------------------------------------------------
-# Entrypoint
-# --------------------------------------------------------------------------
+# ============================================================
+# MAIN
+# ============================================================
 
 async def main():
 
     missing = config.validate()
+
 
     if missing:
 
@@ -1035,21 +1197,30 @@ async def main():
             + ", ".join(missing)
         )
 
+
     await app.start()
 
+
     me = await app.get_me()
+
 
     log.info(
         "Bot started as @%s",
         me.username,
     )
 
+
     asyncio.create_task(
         auto_loop()
     )
 
+
     await asyncio.Event().wait()
 
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
